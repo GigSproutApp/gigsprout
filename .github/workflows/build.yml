@@ -9,7 +9,7 @@ on:
 permissions:
   contents: write
 env:
-  NODE_VERSION: v22.11.0
+  NODE_VERSION: v22.23.4
 
 jobs:
   windows:
