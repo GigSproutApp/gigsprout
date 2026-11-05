@@ -1,6 +1,8 @@
-# Builds one-click downloads every time you publish a GitHub release with GigSprout.zip attached:
-#   GigSprout-Setup.exe  (Windows installer: Node included, desktop + Start menu shortcuts, no unzipping)
-#   GigSprout-Mac.zip    (Mac: Node included, double-click START HERE (Mac))
+# Builds the real desktop app every time you publish a GitHub release with GigSprout.zip attached:
+#   GigSprout-Setup.exe  (Windows app: its own window, desktop + Start menu icons, Node included)
+#   GigSprout-Mac.dmg    (Mac app: drag GigSprout into Applications)
+#   GigSprout-Mac.zip    (older Mac download, kept so existing links keep working)
+# Put this file in your repository at .github/workflows/build.yml
 name: Build installers
 on:
   release:
@@ -15,6 +17,8 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
       - name: Get GigSprout.zip from the release
         shell: pwsh
         env: { GH_TOKEN: "${{ github.token }}" }
@@ -23,63 +27,70 @@ jobs:
           if (-not $tag) { $tag = gh release view --repo "${{ github.repository }}" --json tagName -q .tagName }
           "TAG=$tag" | Out-File -Append $env:GITHUB_ENV
           gh release download $tag --repo "${{ github.repository }}" --pattern "GigSprout.zip" --dir in
-          Expand-Archive in/GigSprout.zip -DestinationPath app
-          $root = (Get-ChildItem app -Directory | Select-Object -First 1).FullName
+          Expand-Archive in/GigSprout.zip -DestinationPath src
+          $root = (Get-ChildItem src -Directory | Select-Object -First 1).FullName
           "APPROOT=$root" | Out-File -Append $env:GITHUB_ENV
-      - name: Add Node.js
+      - name: Prepare the app files and Node
         shell: pwsh
         run: |
+          $d = "$env:APPROOT\desktop"; $r = "$d\build-res"
+          New-Item -ItemType Directory "$r\app", "$r\node" -Force | Out-Null
+          foreach ($f in 'server.js','schema.sql','package.json','lib','public') { Copy-Item "$env:APPROOT\$f" "$r\app\" -Recurse -Force }
+          Copy-Item "$env:APPROOT\public\icons\icon-512.png" "$r\icon.png"
           $v = $env:NODE_VERSION
           Invoke-WebRequest "https://nodejs.org/dist/$v/node-$v-win-x64.zip" -OutFile node.zip
           Expand-Archive node.zip -DestinationPath nodetmp
-          New-Item -ItemType Directory "$env:APPROOT\node" -Force | Out-Null
-          Copy-Item "nodetmp\node-$v-win-x64\node.exe" "$env:APPROOT\node\"
+          Copy-Item "nodetmp\node-$v-win-x64\node.exe" "$r\node\"
+          $ver = ($env:TAG -replace '[^0-9.]', '').Split('.'); while ($ver.Count -lt 3) { $ver += '0' }
+          (Get-Content "$d\package.json") -replace '"version": "[^"]*"', ('"version": "' + ($ver[0..2] -join '.') + '"') | Set-Content "$d\package.json"
       - name: Build GigSprout-Setup.exe
         shell: pwsh
+        env: { CSC_IDENTITY_AUTO_DISCOVERY: "false" }
         run: |
-          choco install innosetup -y --no-progress
-          $ver = $env:TAG -replace '[^0-9.]', ''
-          @"
-          [Setup]
-          AppName=GigSprout
-          AppVersion=$ver
-          AppPublisher=GigSprout
-          DefaultDirName={localappdata}\GigSprout App
-          DisableProgramGroupPage=yes
-          DisableDirPage=yes
-          PrivilegesRequired=lowest
-          OutputDir=out
-          OutputBaseFilename=GigSprout-Setup
-          Compression=lzma2
-          SolidCompression=yes
-          WizardStyle=modern
-          CloseApplications=force
-          [Files]
-          Source: "$env:APPROOT\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
-          [Icons]
-          Name: "{userprograms}\GigSprout"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\GigSprout.vbs"""; WorkingDir: "{app}"
-          Name: "{userdesktop}\GigSprout"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\GigSprout.vbs"""; WorkingDir: "{app}"
-          Name: "{userprograms}\Stop GigSprout"; Filename: "{app}\Stop GigSprout.bat"; WorkingDir: "{app}"
-          [Run]
-          Filename: "{sys}\wscript.exe"; Parameters: """{app}\GigSprout.vbs"""; Description: "Open GigSprout now"; Flags: postinstall nowait
-          [UninstallRun]
-          Filename: "{sys}\taskkill.exe"; Parameters: "/IM node.exe /F"; Flags: runhidden; RunOnceId: "StopGigSprout"
-          "@ | Set-Content setup.iss
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" setup.iss
+          cd "$env:APPROOT\desktop"
+          npm install --no-audit --no-fund
+          npx electron-builder --win nsis --x64 --publish never
       - name: Attach to the release
         shell: pwsh
         env: { GH_TOKEN: "${{ github.token }}" }
-        run: gh release upload $env:TAG out/GigSprout-Setup.exe --clobber --repo "${{ github.repository }}"
+        run: gh release upload $env:TAG "$env:APPROOT\desktop\dist\GigSprout-Setup.exe" --clobber --repo "${{ github.repository }}"
 
   mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: Build GigSprout-Mac.dmg
+        env: { GH_TOKEN: "${{ github.token }}", CSC_IDENTITY_AUTO_DISCOVERY: "false" }
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          [ -n "$TAG" ] || TAG=$(gh release view --repo "${{ github.repository }}" --json tagName -q .tagName)
+          gh release download "$TAG" --repo "${{ github.repository }}" --pattern "GigSprout.zip" --dir in
+          unzip -q in/GigSprout.zip -d src
+          ROOT=$(find src -mindepth 1 -maxdepth 1 -type d | head -1); D="$ROOT/desktop"; R="$D/build-res"
+          mkdir -p "$R/app" "$R/node"
+          cp -R "$ROOT/server.js" "$ROOT/schema.sql" "$ROOT/package.json" "$ROOT/lib" "$ROOT/public" "$R/app/"
+          cp "$ROOT/public/icons/icon-512.png" "$R/icon.png"
+          for A in arm64 x64; do curl -sL "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-darwin-$A.tar.gz" | tar xz; done
+          lipo -create "node-$NODE_VERSION-darwin-arm64/bin/node" "node-$NODE_VERSION-darwin-x64/bin/node" -output "$R/node/node"
+          chmod +x "$R/node/node"
+          VER=$(echo "$TAG" | tr -cd '0-9.'); IFS=. read -r a b c <<< "$VER"; VER="${a:-0}.${b:-0}.${c:-0}"
+          sed -i '' "s/\"version\": \"[^\"]*\"/\"version\": \"$VER\"/" "$D/package.json"
+          cd "$D" && npm install --no-audit --no-fund && npx electron-builder --mac dir --universal --publish never
+          APP=$(find dist -maxdepth 2 -name "GigSprout.app" | head -1)
+          codesign --force --deep --sign - "$APP"
+          mkdir dmg && cp -R "$APP" dmg/ && ln -s /Applications dmg/Applications
+          hdiutil create -volname GigSprout -srcfolder dmg -ov -format UDZO GigSprout-Mac.dmg
+          gh release upload "$TAG" GigSprout-Mac.dmg --clobber --repo "${{ github.repository }}"
+
+  mac-zip:
     runs-on: ubuntu-latest
     steps:
-      - name: Get GigSprout.zip and add Node.js for Mac
+      - name: Older Mac download (folder with START HERE)
         env: { GH_TOKEN: "${{ github.token }}" }
         run: |
           TAG="${{ github.event.release.tag_name }}"
           [ -n "$TAG" ] || TAG=$(gh release view --repo "${{ github.repository }}" --json tagName -q .tagName)
-          echo "TAG=$TAG" >> $GITHUB_ENV
           gh release download "$TAG" --repo "${{ github.repository }}" --pattern "GigSprout.zip" --dir in
           unzip -q in/GigSprout.zip -d app
           ROOT=$(find app -mindepth 1 -maxdepth 1 -type d | head -1)
@@ -88,5 +99,6 @@ jobs:
             mkdir -p "$ROOT/node/$A/bin" && cp "node-$NODE_VERSION-darwin-$A/bin/node" "$ROOT/node/$A/bin/node"
           done
           chmod +x "$ROOT"/node/*/bin/node "$ROOT/START HERE (Mac).command"
+          rm -rf "$ROOT/desktop"
           mv "$ROOT" GigSprout && zip -qry GigSprout-Mac.zip GigSprout
           gh release upload "$TAG" GigSprout-Mac.zip --clobber --repo "${{ github.repository }}"
